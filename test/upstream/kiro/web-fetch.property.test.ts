@@ -121,12 +121,12 @@ async function drain(events: AsyncIterable<{ type: string } & Record<string, unk
 /**
  * Feed already-built server-tool blocks through the real Kiro collector.
  *
- * `new Response(null)` has a null body, which is the collector's "no stream" path: it reports usage
- * derived from `initialServerToolBlocks` and stops. That is the reachable seam for observing all
- * three counters at once without a live call.
+ * A minimal text response keeps the generated turn valid even when there are no server-tool
+ * blocks. Usage is derived from `initialServerToolBlocks`, so all three counters can be observed
+ * without a live call.
  */
 function collectWithServerToolBlocks(blocks: JsonObject[]) {
-  return collectKiroResponse(new Response(null), "claude-sonnet-4-5", [], 11, undefined, blocks)
+  return collectKiroResponse(new Response('{"content":"done"}'), "claude-sonnet-4-5", [], 11, undefined, blocks)
 }
 
 const SERVER_TOOL_COUNTER_KEYS = ["webSearchRequests", "webFetchRequests", "mcpCalls"] as const

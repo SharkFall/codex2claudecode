@@ -3,10 +3,11 @@ import { countTokens } from "gpt-tokenizer"
 import type { Canonical_ContentBlock, Canonical_Event, Canonical_FeatureNotice, Canonical_Response, Canonical_StreamResponse, Canonical_ToolCallBlock } from "../../core/canonical"
 import type { JsonObject } from "../../core/types"
 import { canonicalUsageFromWireUsage, mergeCanonicalUsage, mergeServerToolUse } from "../../core/usage"
-import { DEFAULT_MAX_INPUT_TOKENS } from "./constants"
+import { DEFAULT_MAX_INPUT_TOKENS, kiroStreamProgressTimeoutMs } from "./constants"
+import { redact } from "./errors"
 import { findEventStart } from "./event-frames"
 import { maybeHandleKiroServerTool, type KiroServerToolHandlers } from "./web-search"
-import { maybeHandleKiroWebFetch, webFetchRequestsFromBlocks, type KiroWebFetchHandlers } from "./web-fetch"
+import { KIRO_WEB_FETCH_TOOL_NAME, maybeHandleKiroWebFetch, webFetchRequestsFromBlocks, type KiroWebFetchHandlers } from "./web-fetch"
 import type { KiroMcpSession } from "./mcp-toolset"
 import { parseKiroMeteringUsage } from "./metering"
 import type { KiroParsedEvent, KiroToolCall } from "./types"
@@ -45,6 +46,7 @@ export class AwsEventStreamParser {
   private completed: KiroToolCall[] = []
   private decoder = new TextDecoder()
   private warnedOversizedBuffer = false
+  private invalidToolInput = false
 
   /** Telemetry: number of malformed events skipped during parsing. */
   skippedMalformedEvents = 0
@@ -54,8 +56,12 @@ export class AwsEventStreamParser {
   duplicateContentSkips = 0
 
   feed(chunk: Uint8Array) {
+    return [...this.feedEvents(chunk)]
+  }
+
+  /** Advance tool accumulation one event at a time, preserving wire order within a chunk. */
+  *feedEvents(chunk: Uint8Array): Generator<KiroParsedEvent> {
     this.buffer += this.decoder.decode(chunk, { stream: true })
-    const events: KiroParsedEvent[] = []
 
     for (;;) {
       const start = findEventStart(this.buffer)
@@ -71,28 +77,30 @@ export class AwsEventStreamParser {
       }
       const raw = this.buffer.slice(0, end)
       this.buffer = this.buffer.slice(end)
+      let event: KiroParsedEvent
       try {
-        const event = JSON.parse(raw) as KiroParsedEvent
+        event = JSON.parse(raw) as KiroParsedEvent
         if ("content" in event && event.content === this.lastContent) {
           this.duplicateContentSkips += 1
           continue
         }
         if ("content" in event) this.lastContent = event.content
         this.accumulate(event)
-        events.push(event)
       } catch (error) {
         this.skippedMalformedEvents += 1
         console.warn(`Skipping malformed Kiro event-stream JSON (length=${raw.length}): ${error instanceof Error ? error.message : String(error)}`)
+        continue
       }
+      yield event
     }
-
-    return events
   }
 
   /** Return safe diagnostic metadata (no raw content). */
   diagnostics() {
     return {
       bufferLength: this.buffer.length,
+      pendingEvent: findEventStart(this.buffer) >= 0,
+      invalidToolInput: this.invalidToolInput,
       skippedMalformedEvents: this.skippedMalformedEvents,
       oversizedBufferTrims: this.oversizedBufferTrims,
       duplicateContentSkips: this.duplicateContentSkips,
@@ -106,6 +114,7 @@ export class AwsEventStreamParser {
   }
 
   takeToolCalls() {
+    if (this.invalidToolInput) throw new Error("Kiro stream returned incomplete or invalid tool arguments")
     const calls = [...this.completed]
     this.completed = []
     return calls
@@ -113,6 +122,8 @@ export class AwsEventStreamParser {
 
   finishToolCalls() {
     this.decoder.decode()
+    if (findEventStart(this.buffer) >= 0) throw new Error("Kiro stream ended with an incomplete event")
+    if (this.oversizedBufferTrims) throw new Error("Kiro stream discarded an oversized incomplete event")
     if (this.active) this.finalizeActive()
     return this.takeToolCalls()
   }
@@ -125,6 +136,7 @@ export class AwsEventStreamParser {
     this.decoder.decode()
     this.decoder = new TextDecoder()
     this.warnedOversizedBuffer = false
+    this.invalidToolInput = false
     this.skippedMalformedEvents = 0
     this.oversizedBufferTrims = 0
     this.duplicateContentSkips = 0
@@ -164,7 +176,11 @@ export class AwsEventStreamParser {
   private finalizeActive() {
     if (!this.active) return
     const args = this.active.text || (Object.keys(this.active.object).length ? JSON.stringify(this.active.object) : "{}")
-    this.completed.push({ callId: this.active.callId, name: this.active.name, arguments: validJsonString(args) ? args : "{}" })
+    if (validJsonString(args)) {
+      this.completed.push({ callId: this.active.callId, name: this.active.name, arguments: args })
+    } else {
+      this.invalidToolInput = true
+    }
     this.active = undefined
   }
 }
@@ -342,6 +358,7 @@ export async function collectKiroResponse(
       if (typeof event.usage.providerCredits === "number") providerCredits = (providerCredits ?? 0) + event.usage.providerCredits
       serverToolUse = mergeServerToolUse(serverToolUse, event.usage.serverToolUse)
     }
+    if (event.type === "error") throw new Error(event.message)
     if (event.type === "message_stop") stopReason = event.stopReason as Canonical_Response["stopReason"]
     // Token- and content-neutral (Requirement 8.4), the same isolation the metering branch in
     // `iterateKiroEvents` buys with its `continue`: here the discriminated union does it, since
@@ -401,6 +418,8 @@ async function* iterateKiroEvents(
   let stopReason = "end_turn"
   let sawToolCall = false
   let sawThinking = false
+  let sawUpstreamText = false
+  let sawServerToolOutput = initialServerToolBlocks.length > 0
   let sentThinkingSignature = false
   let thinkingBlockIndex: number | undefined
   let nextBlockIndex = 0
@@ -417,19 +436,43 @@ async function* iterateKiroEvents(
   let webFetchRequests = initialServerToolUse?.webFetchRequests ?? 0
   const emittedToolCalls: Canonical_ToolCallBlock[] = []
   const reader = stream?.getReader()
-  if (prefaceText) yield { type: "text_delta", delta: prefaceText }
-  if (initialServerToolBlocks.length) yield { type: "server_tool_block", blocks: initialServerToolBlocks }
-  if (!reader) {
-    yield {
-      type: "usage",
-      usage: {
-        inputTokens: inputTokenEstimate,
-        outputTokens: text ? estimateKiroFallbackTokens(text) : 0,
-        ...(initialServerToolUse ? { serverToolUse: initialServerToolUse } : {}),
-      },
+  const started = Date.now()
+  const progressTimeoutMs = kiroStreamProgressTimeoutMs()
+  let lastProgressAt = started
+  let firstProgressAt: number | undefined
+  let lastChunkAt: number | undefined
+  let chunks = 0
+  let bytes = 0
+  let events = 0
+  let lastEvent = "none"
+  let bodyFinished = false
+  let readerReleased = false
+  let trailingToolCalls: KiroToolCall[] = []
+  let activeTool: Pick<KiroToolCall, "callId" | "name"> | undefined
+
+  function failure(error: unknown): Canonical_Event {
+    const now = Date.now()
+    const parserState = parser.diagnostics()
+    const diagnostics = {
+      phase: bodyFinished ? "finalization" : firstProgressAt === undefined ? "first_effective_event" : "stream_progress",
+      elapsedMs: now - started,
+      chunks,
+      bytes,
+      events,
+      lastEvent,
+      firstProgressMs: firstProgressAt === undefined ? null : firstProgressAt - started,
+      lastProgressAgoMs: now - lastProgressAt,
+      lastChunkAgoMs: lastChunkAt === undefined ? null : now - lastChunkAt,
+      pendingToolCall: Boolean(parserState.pendingToolCall),
+      pendingEvent: parserState.pendingEvent,
+      invalidToolInput: parserState.invalidToolInput,
+      skippedMalformedEvents: parserState.skippedMalformedEvents,
+      oversizedBufferTrims: parserState.oversizedBufferTrims,
     }
-    yield { type: "message_stop", stopReason }
-    return
+    const reason = redact(error instanceof Error ? error.message : String(error))
+    const message = `${reason}; Kiro stream diagnostics: ${JSON.stringify(diagnostics)}`
+    console.warn(message)
+    return { type: "error", message }
   }
 
   /**
@@ -462,6 +505,8 @@ async function* iterateKiroEvents(
   async function* emitToolCall(call: KiroToolCall): AsyncIterable<Canonical_Event> {
     let emittedClientTool = false
     for await (const event of handleKiroToolCall(call)) {
+      if (event.type === "error") throw new Error(event.message)
+      if (event.type === "server_tool_block" && event.blocks.length) sawServerToolOutput = true
       if (event.type === "tool_call_done") {
         emittedClientTool = true
         emittedToolCalls.push({
@@ -480,6 +525,7 @@ async function* iterateKiroEvents(
       }
       if (event.type === "text_delta") {
         text += event.delta
+        if (event.delta.length) sawUpstreamText = true
       }
       yield event
     }
@@ -489,21 +535,80 @@ async function* iterateKiroEvents(
     }
   }
 
+  async function* emitToolProgress(event: KiroParsedEvent, completed: KiroToolCall[]): AsyncIterable<Canonical_Event> {
+    const started = "name" in event && "toolUseId" in event ? { callId: event.toolUseId, name: event.name } : undefined
+    // A new tool can implicitly finish the previous one in the same wire event.
+    if (started) {
+      for (const call of completed) {
+        if (call.callId !== started.callId) yield* emitToolCall(call)
+      }
+      activeTool = started
+    }
+    if (activeTool && (started || "input" in event)) {
+      const intercepted = mcp?.handles(activeTool.name)
+        || activeTool.name === "web_search" && Boolean(serverTools?.webSearch)
+        || activeTool.name === KIRO_WEB_FETCH_TOOL_NAME && Boolean(serverTools?.webFetch)
+      if (!intercepted) {
+        const argumentsDelta = "input" in event && typeof event.input === "string" ? event.input : ""
+        yield { type: "tool_call_delta", callId: activeTool.callId, name: activeTool.name, argumentsDelta }
+      }
+    }
+    for (const call of completed) {
+      if (!started || call.callId === started.callId) yield* emitToolCall(call)
+      if (call.callId === activeTool?.callId) activeTool = undefined
+    }
+    if (completed.length) lastProgressAt = Date.now()
+  }
+
   try {
+    if (prefaceText) yield { type: "text_delta", delta: prefaceText }
+    if (initialServerToolBlocks.length) yield { type: "server_tool_block", blocks: initialServerToolBlocks }
+    if (!reader) {
+      if (!prefaceText.trim() && !sawServerToolOutput) throw new Error("Kiro response has no body or usable content")
+      yield {
+        type: "usage",
+        usage: {
+          inputTokens: inputTokenEstimate,
+          outputTokens: text ? estimateKiroFallbackTokens(text) : 0,
+          ...(initialServerToolUse ? { serverToolUse: initialServerToolUse } : {}),
+        },
+      }
+      yield { type: "message_stop", stopReason }
+      return
+    }
+
     for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      for (const event of parser.feed(chunk.value)) {
+      const chunk = await readKiroChunk(reader, lastProgressAt + progressTimeoutMs, progressTimeoutMs)
+      if (chunk.done) {
+        bodyFinished = true
+        trailingToolCalls = parser.finishToolCalls()
+        break
+      }
+      chunks += 1
+      bytes += chunk.value.byteLength
+      lastChunkAt = Date.now()
+      for (const event of parser.feedEvents(chunk.value)) {
+        events += 1
+        lastEvent = kiroEventKind(event)
+        if (isKiroProgress(event)) {
+          lastProgressAt = Date.now()
+          firstProgressAt ??= lastProgressAt
+        }
+        const toolCalls = parser.takeToolCalls()
+        yield* emitToolProgress(event, toolCalls)
         if ("content" in event) {
           // Skip Kiro sentinel "(empty)" content — Kiro sends this when the model
           // produces no text before a tool call. It's not real content.
           if (event.content === "(empty)") continue
           const extracted = thinking.feed(event.content)
-          if (extracted.thinking !== undefined) {
+          if (extracted.thinking) {
             sawThinking = true
             if (thinkingBlockIndex === undefined) {
               thinkingBlockIndex = nextBlockIndex++
-              yield { type: "content_block_start", blockType: "thinking", index: thinkingBlockIndex, block: { type: "thinking", thinking: "", signature: "" } }
+              yield {
+                type: "content_block_start", blockType: "thinking", index: thinkingBlockIndex,
+                block: { type: "thinking", thinking: "", signature: "" },
+              }
             }
             yield { type: "thinking_delta", text: extracted.thinking }
           }
@@ -514,6 +619,7 @@ async function* iterateKiroEvents(
               sentThinkingSignature = true
             }
             text += extracted.regular
+            if (extracted.regular.length) sawUpstreamText = true
             yield { type: "text_delta", delta: extracted.regular }
           }
         }
@@ -539,77 +645,127 @@ async function* iterateKiroEvents(
             if (typeof upstreamUsage.outputTokens === "number" && upstreamUsage.outputTokens > 0) usageOutputTokens = upstreamUsage.outputTokens
           }
         }
-        const toolCalls = parser.takeToolCalls()
         if ("stop" in event && event.stop && !toolCalls.length && !sawToolCall) stopReason = "max_tokens"
         if ("contextUsagePercentage" in event && typeof event.contextUsagePercentage === "number") contextUsage = event.contextUsagePercentage
-        for (const call of toolCalls) {
-          yield* emitToolCall(call)
-        }
       }
     }
+    const tail = thinking.finalize()
+    if (tail.thinking) {
+      sawThinking = true
+      if (thinkingBlockIndex === undefined) {
+        thinkingBlockIndex = nextBlockIndex++
+        yield {
+          type: "content_block_start", blockType: "thinking", index: thinkingBlockIndex,
+          block: { type: "thinking", thinking: "", signature: "" },
+        }
+      }
+      yield { type: "thinking_delta", text: tail.thinking }
+    }
+    if (sawThinking && !sentThinkingSignature) {
+      yield { type: "thinking_signature", signature: `sig_${crypto.randomUUID().replace(/-/g, "").slice(0, 32)}` }
+      yield { type: "content_block_stop", index: thinkingBlockIndex ?? 0 }
+      sentThinkingSignature = true
+    }
+    if (tail.regular !== undefined) {
+      text += tail.regular
+      if (tail.regular.length) sawUpstreamText = true
+      yield { type: "text_delta", delta: tail.regular }
+    }
+    for (const call of trailingToolCalls) {
+      yield* emitToolCall(call)
+    }
+    if (emitBracketToolCalls) {
+      const bracketToolBlocks = extractBracketToolCalls(text, effectiveTools, emittedToolCalls).blocks.filter(
+        (block): block is Canonical_ToolCallBlock => block.type === "tool_call",
+      )
+      for (const block of bracketToolBlocks) {
+        yield* emitToolCall({ callId: block.callId, name: block.name, arguments: block.arguments })
+      }
+    }
+    if (!sawUpstreamText && !sawThinking && !sawToolCall && !sawServerToolOutput && stopReason !== "max_tokens") {
+      throw new Error("Kiro stream ended without usable content")
+    }
+    const outputTokens = usageOutputTokens ?? (text ? estimateKiroFallbackTokens(text) : 0)
+    // Three sources, folded left to right: whatever upstream reported, what this turn's server-tool
+    // interception observed, and what the MCP session executed. Each member is still omitted when it
+    // is zero, so a turn that used none of them keeps reporting no `serverToolUse` at all.
+    const serverToolUse = mergeServerToolUse(
+      mergeServerToolUse(
+        upstreamUsage.serverToolUse,
+        webSearchRequests || webFetchRequests
+          ? {
+              ...(webSearchRequests ? { webSearchRequests } : {}),
+              ...(webFetchRequests ? { webFetchRequests } : {}),
+            }
+          : undefined,
+      ),
+      mcp?.serverToolUseDelta(),
+    )
+    yield {
+      type: "usage",
+      usage: {
+        inputTokens: upstreamInputTokens ?? estimateInputTokens(contextUsage, outputTokens, inputTokenEstimate, maxInputTokens),
+        outputTokens,
+        ...(upstreamUsage.cacheCreationInputTokens !== undefined
+          ? { cacheCreationInputTokens: upstreamUsage.cacheCreationInputTokens }
+          : {}),
+        ...(upstreamUsage.cacheReadInputTokens !== undefined ? { cacheReadInputTokens: upstreamUsage.cacheReadInputTokens } : {}),
+        ...(upstreamUsage.outputReasoningTokens !== undefined ? { outputReasoningTokens: upstreamUsage.outputReasoningTokens } : {}),
+        ...(providerCredits !== undefined ? { providerCredits } : {}),
+        ...(serverToolUse ? { serverToolUse } : {}),
+      },
+    }
+    yield { type: "message_stop", stopReason }
   } catch (error) {
-    yield { type: "error", message: error instanceof Error ? error.message : String(error) }
-    return
+    releaseReader(error)
+    yield failure(error)
   } finally {
-    reader.releaseLock()
+    releaseReader()
   }
 
-  const tail = thinking.finalize()
-  if (tail.thinking !== undefined) {
-    sawThinking = true
-    if (thinkingBlockIndex === undefined) {
-      thinkingBlockIndex = nextBlockIndex++
-      yield { type: "content_block_start", blockType: "thinking", index: thinkingBlockIndex, block: { type: "thinking", thinking: "", signature: "" } }
-    }
-    yield { type: "thinking_delta", text: tail.thinking }
+  function releaseReader(reason?: unknown) {
+    if (!reader || readerReleased) return
+    readerReleased = true
+    if (!bodyFinished) void reader.cancel(reason).catch(() => undefined)
+    reader.releaseLock()
   }
-  if (sawThinking && !sentThinkingSignature) {
-    yield { type: "thinking_signature", signature: `sig_${crypto.randomUUID().replace(/-/g, "").slice(0, 32)}` }
-    yield { type: "content_block_stop", index: thinkingBlockIndex ?? 0 }
-    sentThinkingSignature = true
+}
+
+async function readKiroChunk(reader: ReadableStreamDefaultReader<Uint8Array>, deadline: number, timeoutMs: number) {
+  const remainingMs = deadline - Date.now()
+  const timeoutError = () => new Error(`Kiro stream made no effective progress for ${timeoutMs} ms`)
+  if (remainingMs <= 0) throw timeoutError()
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(timeoutError()), remainingMs)
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
   }
-  if (tail.regular !== undefined) {
-    text += tail.regular
-    yield { type: "text_delta", delta: tail.regular }
+}
+
+function kiroEventKind(event: KiroParsedEvent) {
+  if ("content" in event) return "content"
+  if ("name" in event) return "tool_start"
+  if ("input" in event) return "tool_input"
+  if ("stop" in event) return "stop"
+  if ("unit" in event) return "metering"
+  if ("usage" in event) return "usage"
+  if ("contextUsagePercentage" in event) return "context_usage"
+  return "unknown"
+}
+
+function isKiroProgress(event: KiroParsedEvent) {
+  if ("content" in event) return Boolean(event.content) && event.content !== "(empty)"
+  if ("name" in event && "toolUseId" in event) return true
+  if ("input" in event) {
+    return typeof event.input === "string" ? event.input.length > 0 : Boolean(event.input && Object.keys(event.input).length)
   }
-  for (const call of parser.finishToolCalls()) {
-    yield* emitToolCall(call)
-  }
-  if (emitBracketToolCalls) {
-    const bracketToolBlocks = extractBracketToolCalls(text, effectiveTools, emittedToolCalls).blocks.filter((block): block is Canonical_ToolCallBlock => block.type === "tool_call")
-    for (const block of bracketToolBlocks) {
-      yield* emitToolCall({ callId: block.callId, name: block.name, arguments: block.arguments })
-    }
-  }
-  const outputTokens = usageOutputTokens ?? (text ? estimateKiroFallbackTokens(text) : 0)
-  // Three sources, folded left to right: whatever upstream reported, what this turn's server-tool
-  // interception observed, and what the MCP session executed. Each member is still omitted when it
-  // is zero, so a turn that used none of them keeps reporting no `serverToolUse` at all.
-  const serverToolUse = mergeServerToolUse(
-    mergeServerToolUse(
-      upstreamUsage.serverToolUse,
-      webSearchRequests || webFetchRequests
-        ? {
-            ...(webSearchRequests ? { webSearchRequests } : {}),
-            ...(webFetchRequests ? { webFetchRequests } : {}),
-          }
-        : undefined,
-    ),
-    mcp?.serverToolUseDelta(),
-  )
-  yield {
-    type: "usage",
-    usage: {
-      inputTokens: upstreamInputTokens ?? estimateInputTokens(contextUsage, outputTokens, inputTokenEstimate, maxInputTokens),
-      outputTokens,
-      ...(upstreamUsage.cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens: upstreamUsage.cacheCreationInputTokens } : {}),
-      ...(upstreamUsage.cacheReadInputTokens !== undefined ? { cacheReadInputTokens: upstreamUsage.cacheReadInputTokens } : {}),
-      ...(upstreamUsage.outputReasoningTokens !== undefined ? { outputReasoningTokens: upstreamUsage.outputReasoningTokens } : {}),
-      ...(providerCredits !== undefined ? { providerCredits } : {}),
-      ...(serverToolUse ? { serverToolUse } : {}),
-    },
-  }
-  yield { type: "message_stop", stopReason }
+  return "stop" in event && Boolean(event.stop)
 }
 
 /**

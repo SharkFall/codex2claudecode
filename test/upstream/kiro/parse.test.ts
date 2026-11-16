@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { countTokens } from "gpt-tokenizer"
 
-import { AwsEventStreamParser, collectKiroResponse, streamKiroResponse, ThinkingBlockExtractor } from "../../../src/upstream/kiro"
+import { AwsEventStreamParser, collectKiroResponse, streamKiroResponse, ThinkingBlockExtractor } from "../../../src/upstream/kiro/parse"
 import { DEFAULT_MAX_INPUT_TOKENS } from "../../../src/upstream/kiro/constants"
 import type { Canonical_Event } from "../../../src/core/canonical"
 
@@ -684,10 +684,298 @@ describe("collectKiroResponse feature notices", () => {
     expect("featureNotices" in collected).toBe(false)
   })
 
-  test("omits featureNotices on an empty body rather than reporting an empty list", async () => {
-    const collected = await collectKiroResponse(new Response(stream([])), "model", [], 7)
+  test("rejects empty bodies instead of returning an empty success", async () => {
+    await expect(collectKiroResponse(new Response(stream([])), "model", [], 7)).rejects.toThrow("without usable content")
+  })
+})
 
-    expect(collected.featureNotices).toBeUndefined()
-    expect("featureNotices" in collected).toBe(false)
+async function readKiroEvents(source: ReadableStream<Uint8Array> | null) {
+  const events: Canonical_Event[] = []
+  for await (const event of streamKiroResponse(new Response(source), "model", [], 7).events) events.push(event)
+  return events
+}
+
+async function withProgressTimeout(timeoutMs: number, run: () => Promise<void>) {
+  const previous = process.env.KIRO_STREAM_PROGRESS_TIMEOUT_MS
+  process.env.KIRO_STREAM_PROGRESS_TIMEOUT_MS = String(timeoutMs)
+  try {
+    await run()
+  } finally {
+    if (previous === undefined) delete process.env.KIRO_STREAM_PROGRESS_TIMEOUT_MS
+    else process.env.KIRO_STREAM_PROGRESS_TIMEOUT_MS = previous
+  }
+}
+
+describe("Kiro stream progress and completion", () => {
+  for (const body of ["", '{"usage":3}', '{"contextUsagePercentage":10}', '{"content":"(empty)"}']) {
+    test(`rejects a stream without usable content: ${body || "empty"}`, async () => {
+      const events = await readKiroEvents(stream([body]))
+      expect(events.at(-1)).toMatchObject({ type: "error" })
+      expect(events.some((event) => event.type === "message_stop")).toBe(false)
+      expect(events.some((event) => event.type === "error" && event.message.includes("without usable content"))).toBe(true)
+    })
+  }
+
+  test("rejects a missing response body", async () => {
+    const events = await readKiroEvents(null)
+    expect(events.at(-1)).toMatchObject({ type: "error" })
+    expect(events.some((event) => event.type === "message_stop")).toBe(false)
+  })
+
+  test("does not let a local warning hide an empty upstream response", async () => {
+    const events: Canonical_Event[] = []
+    const result = streamKiroResponse(new Response(stream([])), "model", [], 7, undefined, [], "local warning")
+    for await (const event of result.events) events.push(event)
+    expect(events[0]).toMatchObject({ type: "text_delta", delta: "local warning" })
+    expect(events.at(-1)).toMatchObject({ type: "error" })
+  })
+
+  test("preserves thinking-only responses and explicit max_tokens endings", async () => {
+    const thinking = await readKiroEvents(stream(['{"content":"<thinking>working</thinking>"}']))
+    expect(thinking.some((event) => event.type === "thinking_delta" && event.text === "working")).toBe(true)
+    expect(thinking.at(-1)).toMatchObject({ type: "message_stop", stopReason: "end_turn" })
+    const limited = await readKiroEvents(stream(['{"stop":true}']))
+    expect(limited.at(-1)).toMatchObject({ type: "message_stop", stopReason: "max_tokens" })
+  })
+
+  for (const stop of [false, true]) {
+    test(`rejects incomplete tool arguments instead of emitting an empty call, stop=${stop}`, async () => {
+      const body = JSON.stringify({ name: "save", toolUseId: "call_1", input: '{"value":' }) + (stop ? '{"stop":true}' : "")
+      const events = await readKiroEvents(stream([body]))
+      expect(events.at(-1)).toMatchObject({ type: "error" })
+      expect(events.some((event) => event.type === "tool_call_done" || event.type === "message_stop")).toBe(false)
+    })
+  }
+
+  test("rejects a truncated event even after valid text", async () => {
+    const events = await readKiroEvents(stream(['{"content":"partial"}', '{"content":"unfinished']))
+    expect(events.some((event) => event.type === "text_delta")).toBe(true)
+    expect(events.at(-1)).toMatchObject({ type: "error" })
+    expect(events.some((event) => event.type === "message_stop")).toBe(false)
+  })
+
+  test("metadata traffic does not reset the effective-progress deadline", async () => {
+    await withProgressTimeout(30, async () => {
+      let interval: ReturnType<typeof setInterval> | undefined
+      let cancelled = false
+      const source = new ReadableStream<Uint8Array>({
+        start(controller) {
+          interval = setInterval(() => controller.enqueue(new TextEncoder().encode('{"usage":1}')), 2)
+        },
+        cancel() {
+          cancelled = true
+          clearInterval(interval)
+        },
+      })
+      try {
+        const events = await readKiroEvents(source)
+        expect(events.at(-1)).toMatchObject({ type: "error" })
+        expect(events.some((event) => event.type === "error" && event.message.includes("no effective progress"))).toBe(true)
+        expect(cancelled).toBe(true)
+        expect(source.locked).toBe(false)
+      } finally {
+        clearInterval(interval)
+      }
+    })
+  })
+
+  test("thinking and tool input fragments extend the progress deadline", async () => {
+    await withProgressTimeout(100, async () => {
+      const chunks = [
+        { content: "<thinking>working" },
+        { content: " on it</thinking>" },
+        { name: "save", toolUseId: "call_1", input: '{"value":' },
+        { input: "1}" },
+        { stop: true },
+      ]
+      let index = 0
+      const source = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await new Promise((resolve) => setTimeout(resolve, 30))
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(chunks[index++])))
+          if (index === chunks.length) controller.close()
+        },
+      }, { highWaterMark: 0 })
+      const events = await readKiroEvents(source)
+      expect(events.some((event) => event.type === "error")).toBe(false)
+      expect(events.some((event) => event.type === "tool_call_done" && event.arguments === '{"value":1}')).toBe(true)
+      expect(events.at(-1)).toMatchObject({ type: "message_stop", stopReason: "tool_use" })
+    })
+  })
+
+  test("cancels upstream when the event consumer stops before EOF", async () => {
+    let cancelled = false
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(new TextEncoder().encode('{"content":"hello"}')) },
+      cancel() { cancelled = true },
+    })
+    const events = streamKiroResponse(new Response(source), "model", [], 7).events[Symbol.asyncIterator]()
+    expect((await events.next()).value).toMatchObject({ type: "text_delta" })
+    await events.return?.()
+    expect(cancelled).toBe(true)
+    expect(source.locked).toBe(false)
+  })
+
+  test("the collector propagates read errors instead of returning partial success", async () => {
+    const source = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("upstream disconnected")) } })
+    await expect(collectKiroResponse(new Response(source), "model", [], 7)).rejects.toThrow("upstream disconnected")
+  })
+})
+
+describe("Kiro incremental client tool arguments", () => {
+  test("forwards fragments before the tool stop or response EOF arrives", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const source = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
+    const iterator = streamKiroResponse(new Response(source), "model", [], 7).events[Symbol.asyncIterator]()
+    const send = (event: object) => controller.enqueue(new TextEncoder().encode(JSON.stringify(event)))
+    try {
+      send({ name: "save", toolUseId: "call_1", input: '{"value":' })
+      expect((await iterator.next()).value).toEqual({
+        type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: '{"value":',
+      })
+      send({ input: "1}" })
+      expect((await iterator.next()).value).toMatchObject({ type: "tool_call_delta", argumentsDelta: "1}" })
+      send({ stop: true })
+      expect((await iterator.next()).value).toMatchObject({ type: "tool_call_done", arguments: '{"value":1}' })
+      controller.close()
+      expect((await iterator.next()).value.type).toBe("usage")
+      expect((await iterator.next()).value).toMatchObject({ type: "message_stop", stopReason: "tool_use" })
+      expect((await iterator.next()).done).toBe(true)
+    } finally {
+      await iterator.return?.()
+    }
+  })
+
+  for (const explicitStop of [false, true]) {
+    test(`preserves tool ordering within one chunk, explicit stop=${explicitStop}`, async () => {
+      const wire = [
+        { name: "first", toolUseId: "call_1", input: "{}" },
+        ...(explicitStop ? [{ stop: true }] : []),
+        { name: "second", toolUseId: "call_2", input: '{"value":' },
+        { input: "2}" },
+        { stop: true },
+      ]
+      const events = await readKiroEvents(stream([wire.map((event) => JSON.stringify(event)).join("")]))
+      expect(events.filter((event) => event.type === "tool_call_delta" || event.type === "tool_call_done")).toEqual([
+        { type: "tool_call_delta", callId: "call_1", name: "first", argumentsDelta: "{}" },
+        { type: "tool_call_done", callId: "call_1", name: "first", arguments: "{}" },
+        { type: "tool_call_delta", callId: "call_2", name: "second", argumentsDelta: '{"value":' },
+        { type: "tool_call_delta", callId: "call_2", name: "second", argumentsDelta: "2}" },
+        { type: "tool_call_done", callId: "call_2", name: "second", arguments: '{"value":2}' },
+      ])
+    })
+  }
+
+  test("preserves a large tool argument across many incremental events", async () => {
+    const args = JSON.stringify({ content: "x".repeat(96 * 1024) })
+    const wire: object[] = [{ name: "save", toolUseId: "call_1", input: "" }]
+    for (let offset = 0; offset < args.length; offset += 256) wire.push({ input: args.slice(offset, offset + 256) })
+    wire.push({ stop: true })
+    const events = await readKiroEvents(stream(wire.map((event) => JSON.stringify(event))))
+    const fragments = events.flatMap((event) => event.type === "tool_call_delta" ? [event.argumentsDelta] : [])
+    expect(fragments.length).toBeGreaterThan(300)
+    expect(fragments.join("")).toBe(args)
+    expect(events.filter((event) => event.type === "tool_call_done")).toEqual([
+      { type: "tool_call_done", callId: "call_1", name: "save", arguments: args },
+    ])
+    expect(events.at(-1)).toMatchObject({ type: "message_stop", stopReason: "tool_use" })
+  })
+
+  test("forwards input on a named stop event before completing the call", async () => {
+    const wire = [
+      { name: "save", toolUseId: "call_1", input: '{"value":' },
+      { name: "save", toolUseId: "call_1", input: "1}", stop: true },
+    ]
+    const events = await readKiroEvents(stream(wire.map((event) => JSON.stringify(event))))
+    expect(events.slice(0, 3)).toEqual([
+      { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: '{"value":' },
+      { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: "1}" },
+      { type: "tool_call_done", callId: "call_1", name: "save", arguments: '{"value":1}' },
+    ])
+  })
+
+  test("keeps object input merging until completion instead of concatenating JSON objects", async () => {
+    const wire = [{ name: "save", toolUseId: "call_1", input: { a: 1 } }, { input: { b: 2 } }, { stop: true }]
+    const events = await readKiroEvents(stream(wire.map((event) => JSON.stringify(event))))
+    const fragments = events.flatMap((event) => event.type === "tool_call_delta" ? [event.argumentsDelta] : [])
+    expect(fragments.join("")).toBe("")
+    expect(events.find((event) => event.type === "tool_call_done")).toMatchObject({ arguments: '{"a":1,"b":2}' })
+    const collected = await collectKiroResponse(new Response(stream(wire.map((event) => JSON.stringify(event)))), "model", [], 7)
+    expect(collected.content.filter((block) => block.type === "tool_call")).toHaveLength(1)
+  })
+
+  test("reports a disconnect after partial arguments without completing the tool", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const source = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
+    const iterator = streamKiroResponse(new Response(source), "model", [], 7).events[Symbol.asyncIterator]()
+    try {
+      controller.enqueue(new TextEncoder().encode(JSON.stringify({ name: "save", toolUseId: "call_1", input: '{"value":' })))
+      expect((await iterator.next()).value.type).toBe("tool_call_delta")
+      controller.error(new Error("synthetic connection reset"))
+      const failure = (await iterator.next()).value
+      expect(failure).toMatchObject({ type: "error" })
+      expect(failure.message).toContain("synthetic connection reset")
+      expect((await iterator.next()).done).toBe(true)
+    } finally {
+      await iterator.return?.()
+    }
+  })
+
+  for (const execute of [false, true]) {
+    test(`buffers server web search arguments, execution=${execute}`, async () => {
+      const queries: string[] = []
+      const wire = [{ name: "web_search", toolUseId: "call_1", input: '{"query":"' }, { input: 'hello"}' }, { stop: true }]
+      const response = streamKiroResponse(new Response(stream(wire.map((event) => JSON.stringify(event)))), "model", [], 7, {
+        webSearch: async (query) => {
+          queries.push(query)
+          return execute ? { toolUseId: "srv_1", results: { results: [] }, summary: "done" } : undefined
+        },
+      })
+      const events: Canonical_Event[] = []
+      for await (const event of response.events) events.push(event)
+      expect(queries).toEqual(["hello"])
+      expect(events.some((event) => event.type === "tool_call_delta")).toBe(false)
+      expect(events.some((event) => event.type === "server_tool_block")).toBe(execute)
+      expect(events.some((event) => event.type === "tool_call_done")).toBe(!execute)
+    })
+  }
+
+  test("buffers server web fetch arguments even when the handler falls back to the client", async () => {
+    const urls: string[] = []
+    const wire = [
+      { name: "web_fetch", toolUseId: "call_1", input: '{"url":"https://' },
+      { input: 'example.com/page"}' },
+      { stop: true },
+    ]
+    const response = streamKiroResponse(new Response(stream(wire.map((event) => JSON.stringify(event)))), "model", [], 7, {
+      webFetch: async (url) => { urls.push(url); return undefined },
+    })
+    const events: Canonical_Event[] = []
+    for await (const event of response.events) events.push(event)
+    expect(urls).toEqual(["https://example.com/page"])
+    expect(events.some((event) => event.type === "tool_call_delta")).toBe(false)
+    expect(events.some((event) => event.type === "tool_call_done")).toBe(true)
+  })
+
+  test("does not forward arguments for tools owned by the MCP session", async () => {
+    const calls: string[] = []
+    const wire = [{ name: "mcp__test__lookup", toolUseId: "call_1", input: "{}" }, { stop: true }]
+    const response = streamKiroResponse(
+      new Response(stream(wire.map((event) => JSON.stringify(event)))), "model", [], 7, undefined, [], "", undefined,
+      {
+        tools: [], notices: [], serverUrls: new Set<string>(), mcpCalls: 0, active: true,
+        handles: (name) => name === "mcp__test__lookup",
+        async *handleToolCall(call) {
+          calls.push(call.arguments)
+          yield { type: "server_tool_block", blocks: [{ type: "mcp_tool_result", tool_use_id: call.callId, content: "done" }] }
+        },
+        serverToolUseDelta: () => ({ mcpCalls: calls.length }),
+      },
+    )
+    const events: Canonical_Event[] = []
+    for await (const event of response.events) events.push(event)
+    expect(calls).toEqual(["{}"])
+    expect(events.some((event) => event.type === "tool_call_delta" || event.type === "tool_call_done")).toBe(false)
+    expect(events.some((event) => event.type === "server_tool_block")).toBe(true)
   })
 })
