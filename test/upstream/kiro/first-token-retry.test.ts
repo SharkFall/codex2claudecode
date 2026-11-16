@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { FirstTokenTimeoutError, streamWithFirstTokenRetry } from "../../../src/upstream/kiro"
+import { FirstTokenTimeoutError, streamWithFirstTokenRetry } from "../../../src/upstream/kiro/stream-retry"
 
 const encoder = new TextEncoder()
 
@@ -113,5 +113,72 @@ describe("Kiro first-token retry", () => {
       expect((error as DOMException).name).toBe("AbortError")
       expect(calls).toBe(1)
     }
+  })
+})
+
+describe("Kiro response wait boundaries", () => {
+  test("bounds waiting for response headers without replaying the request", async () => {
+    let calls = 0
+    let signal: AbortSignal | undefined
+    let resolveResponse: ((response: Response) => void) | undefined
+    const pending = streamWithFirstTokenRetry((currentSignal) => {
+      calls += 1
+      signal = currentSignal
+      return new Promise<Response>((resolve) => { resolveResponse = resolve })
+    }, { headersTimeoutMs: 5, timeoutMs: 5, maxRetries: 2 })
+    await expect(pending).rejects.toThrow("Kiro response headers timed out")
+    expect(calls).toBe(1)
+    expect(signal?.aborted).toBe(true)
+
+    let cancelled = false
+    resolveResponse!(stalledResponse(() => { cancelled = true }))
+    await Promise.resolve()
+    expect(cancelled).toBe(true)
+  })
+
+  test("caller abort stops a header wait even when makeResponse ignores cancellation", async () => {
+    const caller = new AbortController()
+    let calls = 0
+    const pending = streamWithFirstTokenRetry(() => {
+      calls += 1
+      return new Promise<Response>(() => {})
+    }, { signal: caller.signal, headersTimeoutMs: 10_000 })
+    caller.abort(new DOMException("caller stopped", "AbortError"))
+    await expect(pending).rejects.toThrow("caller stopped")
+    expect(calls).toBe(1)
+  })
+
+  test("does not replay a stream after its first metadata chunk", async () => {
+    let calls = 0
+    let sourceController: ReadableStreamDefaultController<Uint8Array> | undefined
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        sourceController = controller
+        controller.enqueue(encoder.encode('{"usage":1}'))
+      },
+    })
+    const response = await streamWithFirstTokenRetry(() => {
+      calls += 1
+      return Promise.resolve(new Response(source))
+    }, { timeoutMs: 5, maxRetries: 2 })
+    const reader = response.body!.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('{"usage":1}')
+    sourceController!.error(new Error("upstream disconnected"))
+    await expect(reader.read()).rejects.toThrow("upstream disconnected")
+    reader.releaseLock()
+    expect(calls).toBe(1)
+    expect(source.locked).toBe(false)
+  })
+
+  test("releases the source reader when the rebuilt response is cancelled", async () => {
+    let cancelled = false
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(encoder.encode("first")) },
+      cancel() { cancelled = true },
+    })
+    const response = await streamWithFirstTokenRetry(() => Promise.resolve(new Response(source)))
+    await response.body!.cancel("client disconnected")
+    expect(cancelled).toBe(true)
+    expect(source.locked).toBe(false)
   })
 })

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
-import { Kiro_Client, Kiro_Auth_Manager } from "../../../src/upstream/kiro"
+import { Kiro_Client } from "../../../src/upstream/kiro/client"
+import { Kiro_Auth_Manager } from "../../../src/upstream/kiro/auth"
 import { KiroHttpError, KiroMcpError, KiroNetworkError } from "../../../src/upstream/kiro/types"
 
 function auth(overrides: Record<string, unknown> = {}) {
@@ -530,5 +531,116 @@ describe("Kiro client", () => {
     expect(calls[0]).toContain("refreshToken")
     expect(calls[1]).toContain("/ListAvailableModels")
     expect(authorization).toBe("Bearer fresh")
+  })
+})
+
+async function withStreamTotalTimeout(timeoutMs: number, run: () => Promise<void>) {
+  const previous = process.env.KIRO_STREAM_TOTAL_TIMEOUT_MS
+  process.env.KIRO_STREAM_TOTAL_TIMEOUT_MS = String(timeoutMs)
+  try {
+    await run()
+  } finally {
+    if (previous === undefined) delete process.env.KIRO_STREAM_TOTAL_TIMEOUT_MS
+    else process.env.KIRO_STREAM_TOTAL_TIMEOUT_MS = previous
+  }
+}
+
+describe("Kiro streaming request lifetime", () => {
+  test("keeps the total timeout active after headers and the first body chunk", async () => {
+    await withStreamTotalTimeout(30, async () => {
+      let signal: AbortSignal | undefined
+      let cancelled = false
+      const source = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode("first")) },
+        cancel() { cancelled = true },
+      })
+      const client = new Kiro_Client(auth(), {
+        fetch: ((_, init) => {
+          signal = init?.signal as AbortSignal
+          return Promise.resolve(new Response(source))
+        }) as typeof fetch,
+      })
+      const response = await client.generateAssistantResponse(payload(), { stream: true })
+      const reader = response.body!.getReader()
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe("first")
+      await expect(reader.read()).rejects.toThrow("Kiro stream total timeout")
+      reader.releaseLock()
+      expect(signal?.aborted).toBe(true)
+      expect(cancelled).toBe(true)
+      expect(source.locked).toBe(false)
+    })
+  })
+
+  test("cleans up the timer and caller listener after normal EOF", async () => {
+    await withStreamTotalTimeout(30, async () => {
+      const caller = new AbortController()
+      let signal: AbortSignal | undefined
+      const client = new Kiro_Client(auth(), {
+        fetch: ((_, init) => {
+          signal = init?.signal as AbortSignal
+          return Promise.resolve(new Response("complete"))
+        }) as typeof fetch,
+      })
+      const response = await client.generateAssistantResponse(payload(), { signal: caller.signal, stream: true })
+      expect(await response.text()).toBe("complete")
+      caller.abort()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(signal?.aborted).toBe(false)
+    })
+  })
+
+  test("caller cancellation rejects a pending body read even when the source ignores its signal", async () => {
+    const caller = new AbortController()
+    let cancelled = false
+    const source = new ReadableStream<Uint8Array>({ cancel() { cancelled = true } })
+    const client = new Kiro_Client(auth(), { fetch: (() => Promise.resolve(new Response(source))) as typeof fetch })
+    const response = await client.generateAssistantResponse(payload(), { signal: caller.signal, stream: true })
+    const reader = response.body!.getReader()
+    const pending = reader.read()
+    caller.abort(new DOMException("caller stopped", "AbortError"))
+    await expect(pending).rejects.toThrow("caller stopped")
+    reader.releaseLock()
+    expect(cancelled).toBe(true)
+    expect(source.locked).toBe(false)
+  })
+
+  test("downstream cancellation aborts upstream without awaiting stalled source cancellation", async () => {
+    let signal: AbortSignal | undefined
+    let cancelled = false
+    const source = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true
+        return new Promise<void>(() => {})
+      },
+    })
+    const client = new Kiro_Client(auth(), {
+      fetch: ((_, init) => {
+        signal = init?.signal as AbortSignal
+        return Promise.resolve(new Response(source))
+      }) as typeof fetch,
+    })
+    const response = await client.generateAssistantResponse(payload(), { stream: true })
+    await response.body!.cancel("client disconnected")
+    expect(signal?.aborted).toBe(true)
+    expect(cancelled).toBe(true)
+    expect(source.locked).toBe(false)
+  })
+
+  test("releases the body reader and timer after a source read error", async () => {
+    await withStreamTotalTimeout(30, async () => {
+      let signal: AbortSignal | undefined
+      const source = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("read failed")) } })
+      const client = new Kiro_Client(auth(), {
+        fetch: ((_, init) => {
+          signal = init?.signal as AbortSignal
+          return Promise.resolve(new Response(source))
+        }) as typeof fetch,
+      })
+      const response = await client.generateAssistantResponse(payload(), { stream: true })
+      await expect(response.text()).rejects.toThrow("read failed")
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(signal?.aborted).toBe(false)
+      expect(source.locked).toBe(false)
+    })
   })
 })

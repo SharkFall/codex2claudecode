@@ -14,6 +14,8 @@ export const GET_USAGE_LIMITS_PATH = "/getUsageLimits"
 
 export const TOKEN_REFRESH_THRESHOLD_SECONDS = 600
 export const STREAMING_READ_TIMEOUT_MS = 300_000
+export const KIRO_RESPONSE_HEADERS_TIMEOUT_MS = 60_000
+export const KIRO_STREAM_PROGRESS_TIMEOUT_MS = 120_000
 export const KIRO_FIRST_TOKEN_TIMEOUT_MS = 15_000
 export const KIRO_FIRST_TOKEN_MAX_RETRIES = 1
 export const MAX_RETRIES = 3
@@ -43,6 +45,19 @@ export function kiroPayloadSizeLimitBytes(env: Record<string, string | undefined
   return PAYLOAD_SIZE_LIMIT_BYTES
 }
 
+export function kiroResponseHeadersTimeoutMs(env: Record<string, string | undefined> = process.env) {
+  return parsePositiveInteger(env.KIRO_RESPONSE_HEADERS_TIMEOUT_MS) ?? KIRO_RESPONSE_HEADERS_TIMEOUT_MS
+}
+
+export function kiroStreamTotalTimeoutMs(env: Record<string, string | undefined> = process.env) {
+  return parsePositiveInteger(env.KIRO_STREAM_TOTAL_TIMEOUT_MS) ?? STREAMING_READ_TIMEOUT_MS
+}
+
+export function kiroStreamProgressTimeoutMs(env: Record<string, string | undefined> = process.env) {
+  return parsePositiveInteger(env.KIRO_STREAM_PROGRESS_TIMEOUT_MS) ?? KIRO_STREAM_PROGRESS_TIMEOUT_MS
+}
+
+// This compatibility setting limits the first response-body chunk, not the first semantic token.
 export function kiroFirstTokenTimeoutMs(env: Record<string, string | undefined> = process.env) {
   return parsePositiveInteger(env.KIRO_FIRST_TOKEN_TIMEOUT_MS) ?? KIRO_FIRST_TOKEN_TIMEOUT_MS
 }

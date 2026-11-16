@@ -4,8 +4,8 @@ import { McpClient, type McpJsonRpcResponse } from "../../core/mcp/client"
 import { isMcpProtocolError } from "../../core/mcp/errors"
 import {
   BASE_RETRY_DELAY_MS, DEFAULT_KIRO_API_REGION, GENERATE_ASSISTANT_RESPONSE_PATH, GET_USAGE_LIMITS_PATH, KIRO_API_HOST_TEMPLATE,
-  LIST_AVAILABLE_MODELS_PATH, LIST_AVAILABLE_PROFILES_MAX_PAGES, LIST_AVAILABLE_PROFILES_PATH, MAX_RETRIES, STREAMING_READ_TIMEOUT_MS,
-  USER_AGENT_TEMPLATE, X_AMZ_USER_AGENT_TEMPLATE, resolveKiroVersion,
+  LIST_AVAILABLE_MODELS_PATH, LIST_AVAILABLE_PROFILES_MAX_PAGES, LIST_AVAILABLE_PROFILES_PATH, MAX_RETRIES,
+  USER_AGENT_TEMPLATE, X_AMZ_USER_AGENT_TEMPLATE, kiroStreamTotalTimeoutMs, resolveKiroVersion,
 } from "./constants"
 import type { Kiro_Auth_Manager } from "./auth"
 import { parseMcpWebSearchResults, webSearchSummary } from "./web-search"
@@ -282,18 +282,23 @@ export class Kiro_Client {
   private async requestOnce(url: string, method: string, body?: string, options: RequestSignalOptions = {}, attempt = 1) {
     const accessToken = await this.auth.getAccessToken()
     const requestSignal = createRequestSignal(options)
+    let bodyOwnsCleanup = false
     try {
-      return await this.fetchFn(url, {
+      const response = await this.fetchFn(url, {
         method,
         headers: this.headers(accessToken, method, attempt),
         body,
         signal: requestSignal.signal,
       })
+      if (!options.stream || !response.body) return response
+      const streamingResponse = withRequestLifetime(response, requestSignal)
+      bodyOwnsCleanup = true
+      return streamingResponse
     } catch (error) {
       if (isAbortError(error) && (options.signal?.aborted || options.timeoutMs !== undefined && !options.stream)) throw error
       throw new KiroNetworkError(error)
     } finally {
-      requestSignal.cleanup()
+      if (!bodyOwnsCleanup) requestSignal.cleanup()
     }
   }
 
@@ -450,8 +455,8 @@ interface RequestSignalOptions {
 }
 
 function createRequestSignal(options: RequestSignalOptions) {
-  const timeoutMs = options.timeoutMs ?? (options.stream ? STREAMING_READ_TIMEOUT_MS : undefined)
-  if (timeoutMs === undefined) return { signal: options.signal, cleanup: () => {} }
+  const timeoutMs = options.timeoutMs ?? (options.stream ? kiroStreamTotalTimeoutMs() : undefined)
+  if (timeoutMs === undefined) return { signal: options.signal, cleanup: () => {}, abort: (_reason?: unknown) => {} }
 
   const controller = new AbortController()
   const abortFromCaller = () => controller.abort(options.signal?.reason)
@@ -461,13 +466,66 @@ function createRequestSignal(options: RequestSignalOptions) {
     options.signal?.addEventListener("abort", abortFromCaller, { once: true })
   }
 
-  const timeout = setTimeout(() => controller.abort(new DOMException("Signal timed out", "AbortError")), timeoutMs)
+  const message = options.stream ? `Kiro stream total timeout after ${timeoutMs} ms` : "Signal timed out"
+  const timeout = setTimeout(() => controller.abort(new DOMException(message, "AbortError")), timeoutMs)
+  timeout.unref()
   return {
     signal: controller.signal,
+    abort: (reason?: unknown) => controller.abort(reason),
     cleanup: () => {
       clearTimeout(timeout)
+      options.signal?.removeEventListener("abort", abortFromCaller)
     },
   }
+}
+
+function withRequestLifetime(response: Response, lifetime: ReturnType<typeof createRequestSignal>) {
+  const reader = response.body!.getReader()
+  let finished = false
+  let onAbort: (() => void) | undefined
+
+  function finish(cancel = false, reason?: unknown) {
+    if (finished) return
+    finished = true
+    if (onAbort) lifetime.signal?.removeEventListener("abort", onAbort)
+    lifetime.cleanup()
+    if (cancel) void reader.cancel(reason).catch(() => undefined)
+    reader.releaseLock()
+  }
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      onAbort = () => {
+        if (finished) return
+        const reason = lifetime.signal?.reason ?? new DOMException("The operation was aborted", "AbortError")
+        controller.error(reason)
+        finish(true, reason)
+      }
+      lifetime.signal?.addEventListener("abort", onAbort, { once: true })
+      if (lifetime.signal?.aborted) onAbort()
+    },
+    async pull(controller) {
+      try {
+        const chunk = await reader.read()
+        if (finished) return
+        if (chunk.done) {
+          finish()
+          controller.close()
+        } else {
+          controller.enqueue(chunk.value)
+        }
+      } catch (error) {
+        if (finished) return
+        finish(true, error)
+        controller.error(error)
+      }
+    },
+    cancel(reason) {
+      finish(true, reason)
+      lifetime.abort(reason)
+    },
+  }, { highWaterMark: 0 })
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: responseHeaders(response.headers) })
 }
 
 function renderTemplate(template: string, fingerprint: string, kiroVersion: string) {
