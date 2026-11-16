@@ -15,6 +15,7 @@ export class ClaudeSseWriter {
   private contentIndex = 0
   private textOpen = false
   private thinkingOpen = false
+  private readonly toolBlocks = new Map<string, { index: number; name: string; arguments: string }>()
 
   constructor(controller: ReadableStreamDefaultController<Uint8Array>) {
     this.controller = controller
@@ -38,6 +39,11 @@ export class ClaudeSseWriter {
   /** Whether a thinking block is currently open. */
   get isThinkingOpen(): boolean {
     return this.thinkingOpen
+  }
+
+  /** Tool blocks stay open until their complete arguments arrive. */
+  get hasOpenToolBlocks(): boolean {
+    return this.toolBlocks.size > 0
   }
 
   /** Next content index that won't collide with already-emitted blocks. */
@@ -138,27 +144,48 @@ export class ClaudeSseWriter {
     })
   }
 
-  /** Emit a complete tool_use content block (start + deltas + stop). */
+  /** Open a tool block once and forward argument fragments without waiting for completion. */
+  toolUseDelta(callId: string, name: string, argumentsDelta: string): void {
+    const state = this.ensureToolUseBlock(callId, name)
+    if (!argumentsDelta) return
+    this.send("content_block_delta", {
+      type: "content_block_delta",
+      index: state.index,
+      delta: { type: "input_json_delta", partial_json: argumentsDelta },
+    })
+    state.arguments += argumentsDelta
+  }
+
+  /** Complete a tool block, emitting only the argument suffix not already streamed. */
   toolUseBlock(callId: string, name: string, args: string): void {
+    const state = this.ensureToolUseBlock(callId, name)
+    if (!args.startsWith(state.arguments)) throw new Error("Completed tool arguments do not match streamed arguments")
+    this.toolUseDelta(callId, name, args.slice(state.arguments.length))
+    this.send("content_block_stop", { type: "content_block_stop", index: state.index })
+    this.toolBlocks.delete(callId)
+  }
+
+  private ensureToolUseBlock(callId: string, name: string) {
+    const existing = this.toolBlocks.get(callId)
+    if (existing) {
+      if (existing.name !== name) throw new Error("Tool name changed during argument streaming")
+      return existing
+    }
     this.stopThinkingBlock()
     this.stopTextBlock()
+    const state = { index: this.contentIndex++, name, arguments: "" }
+    this.toolBlocks.set(callId, state)
     this.send("content_block_start", {
       type: "content_block_start",
-      index: this.contentIndex,
+      index: state.index,
       content_block: { type: "tool_use", id: callId, name, input: {} },
     })
     this.send("content_block_delta", {
       type: "content_block_delta",
-      index: this.contentIndex,
+      index: state.index,
       delta: { type: "input_json_delta", partial_json: "" },
     })
-    this.send("content_block_delta", {
-      type: "content_block_delta",
-      index: this.contentIndex,
-      delta: { type: "input_json_delta", partial_json: args },
-    })
-    this.send("content_block_stop", { type: "content_block_stop", index: this.contentIndex })
-    this.contentIndex += 1
+    return state
   }
 
   /** Emit server tool blocks (server_tool_use, web_search_tool_result, mcp_tool_use, etc.). */
@@ -222,8 +249,8 @@ export class ClaudeSseWriter {
   }
 
   /**
-   * Close any open content blocks safely. Use this before emitting
-   * error events or closing the stream after an exception.
+   * Close text and thinking blocks before ending a stream.
+   * Unfinished tool blocks stay incomplete when an error terminates the response.
    */
   closeOpenBlocks(thinkingSignature?: string): void {
     this.stopThinkingBlock(thinkingSignature)
@@ -234,6 +261,7 @@ export class ClaudeSseWriter {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.toolBlocks.clear()
     try {
       this.controller.close()
     } catch {

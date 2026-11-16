@@ -248,6 +248,11 @@ export function claudeCanonicalStreamResponse(response: Canonical_StreamResponse
               }
               continue
             }
+            if (event.type === "tool_call_delta") {
+              writer.stopThinkingBlock(thinkingSignature)
+              writer.toolUseDelta(event.callId, event.name, event.argumentsDelta)
+              continue
+            }
             if (event.type === "tool_call_done") {
               writer.stopThinkingBlock(thinkingSignature)
               writer.toolUseBlock(event.callId, event.name, event.arguments)
@@ -295,6 +300,7 @@ export function claudeCanonicalStreamResponse(response: Canonical_StreamResponse
             }
           }
 
+          if (writer.hasOpenToolBlocks) throw new Error("Upstream stream ended with incomplete tool calls")
           flushTrailingWarning()
           writer.closeOpenBlocks(thinkingSignature)
           const wireServerToolUse = claudeServerToolUse(serverToolUse)
@@ -308,6 +314,7 @@ export function claudeCanonicalStreamResponse(response: Canonical_StreamResponse
           writer.messageStop()
           closeStream()
         } catch (error) {
+          writer.closeOpenBlocks(thinkingSignature)
           writer.error(claudeErrorBody(error instanceof Error ? error.message : String(error), 500))
           closeStream()
         } finally {

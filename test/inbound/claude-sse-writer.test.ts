@@ -248,3 +248,63 @@ describe("ClaudeSseWriter", () => {
     expect(events).toHaveLength(1)
   })
 })
+
+describe("ClaudeSseWriter incremental tools", () => {
+  test("emits each argument fragment once and only closes on completion", async () => {
+    const { writer, collectEvents } = createWriter()
+    writer.toolUseDelta("call_1", "save", '{"value":')
+    writer.toolUseDelta("call_1", "save", "1}")
+    expect(writer.hasOpenToolBlocks).toBe(true)
+    writer.toolUseBlock("call_1", "save", '{"value":1}')
+    expect(writer.hasOpenToolBlocks).toBe(false)
+    const events = await collectEvents()
+    expect(events.filter((event) => event.event === "content_block_start")).toHaveLength(1)
+    expect(events.filter((event) => event.event === "content_block_stop")).toHaveLength(1)
+    expect(events.flatMap((event) => event.data.delta?.type === "input_json_delta" ? [event.data.delta.partial_json] : []))
+      .toEqual(["", '{"value":', "1}"])
+  })
+
+  test("appends a completion suffix without repeating earlier fragments", async () => {
+    const { writer, collectEvents } = createWriter()
+    writer.toolUseDelta("call_1", "save", '{"value":')
+    writer.toolUseBlock("call_1", "save", '{"value":1}')
+    const events = await collectEvents()
+    expect(events.flatMap((event) => event.data.delta?.partial_json ?? []).join("")).toBe('{"value":1}')
+  })
+
+  test("assigns distinct indices to interleaved tools and subsequent text", async () => {
+    const { writer, collectEvents } = createWriter()
+    writer.toolUseDelta("call_1", "first", '{"a":')
+    writer.toolUseDelta("call_2", "second", '{"b":')
+    writer.toolUseBlock("call_2", "second", '{"b":2}')
+    writer.toolUseBlock("call_1", "first", '{"a":1}')
+    writer.startTextBlock()
+    writer.textDelta("done")
+    writer.closeOpenBlocks()
+    const events = await collectEvents()
+    expect(events.filter((event) => event.event === "content_block_start").map((event) => event.data.index)).toEqual([0, 1, 2])
+    for (const [index, args] of [[0, '{"a":1}'], [1, '{"b":2}']] as const) {
+      expect(events.filter((event) => event.data.index === index).flatMap((event) => event.data.delta?.partial_json ?? []).join(""))
+        .toBe(args)
+      expect(events.filter((event) => event.event === "content_block_stop" && event.data.index === index)).toHaveLength(1)
+    }
+  })
+
+  test("an error leaves partial tool arguments incomplete", async () => {
+    const { writer, collectEvents } = createWriter()
+    writer.toolUseDelta("call_1", "save", '{"value":')
+    writer.closeOpenBlocks()
+    writer.error({ type: "error", error: { type: "api_error", message: "connection reset" } })
+    const events = await collectEvents()
+    expect(events.some((event) => event.event === "content_block_stop" || event.event === "message_stop")).toBe(false)
+    expect(events.at(-1)?.event).toBe("error")
+  })
+
+  test("rejects a completion that contradicts already emitted arguments", async () => {
+    const { writer, collectEvents } = createWriter()
+    writer.toolUseDelta("call_1", "save", '{"value":1')
+    expect(() => writer.toolUseBlock("call_1", "save", '{"value":2}')).toThrow("do not match")
+    const events = await collectEvents()
+    expect(events.some((event) => event.event === "content_block_stop")).toBe(false)
+  })
+})

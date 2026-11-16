@@ -3,7 +3,8 @@ import { describe, expect, test } from "bun:test"
 import type { Canonical_Event, Canonical_Request } from "../../src/core/canonical"
 import { Codex_Upstream_Provider } from "../../src/upstream/codex"
 import { canonicalToCodexBody, collectCodexResponse, streamCodexResponse } from "../../src/upstream/codex/parse"
-import { sse } from "../helpers"
+import { claudeCanonicalStreamResponse } from "../../src/inbound/claude/response"
+import { readSse, sse } from "../helpers"
 
 function canonicalRequest(overrides: Partial<Canonical_Request> = {}): Canonical_Request {
   return {
@@ -605,4 +606,48 @@ describe("Codex_Upstream_Provider edge cases", () => {
     const health = await provider.checkHealth(5000)
     expect(health.ok).toBe(true)
   })
+})
+
+describe("Codex tools through the Claude streaming adapter", () => {
+  for (const embeddedItem of [false, true]) {
+    test(`preserves complete calls without placeholder IDs or duplicated arguments, embedded item=${embeddedItem}`, async () => {
+      const item = { type: "function_call", id: "fc_1", call_id: "call_1", name: "save", arguments: '{"value":1}' }
+      const wire = [
+        { type: "response.created", response: { id: "resp_1", model: "model" } },
+        { type: "response.output_item.added", item: { ...item, arguments: "" } },
+        {
+          type: "response.function_call_arguments.delta", item_id: "fc_1", delta: '{"value":',
+          ...(embeddedItem ? { item: { call_id: "call_1", name: "save" } } : {}),
+        },
+        {
+          type: "response.function_call_arguments.done", item_id: "fc_1", arguments: item.arguments,
+          ...(embeddedItem ? { item } : {}),
+        },
+        { type: "response.output_item.done", item },
+        { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 2 }, output: [item] } },
+      ]
+      const canonicalEvents: Canonical_Event[] = []
+      for await (const event of streamCodexResponse(new Response(sse(wire)), "model").events) canonicalEvents.push(event)
+      expect(canonicalEvents.filter((event) => event.type === "tool_call_done")).toEqual([
+        { type: "tool_call_done", callId: "call_1", name: "save", arguments: item.arguments },
+      ])
+      expect(canonicalEvents.some((event) => event.type === "tool_call_delta")).toBe(false)
+
+      const response = claudeCanonicalStreamResponse(
+        streamCodexResponse(new Response(sse(wire)), "model"),
+        { model: "model", messages: [], stream: true },
+        { heartbeatMs: 0 },
+      )
+      const events = await readSse(response)
+      const toolStarts = events.filter((event) => event.data.content_block?.type === "tool_use")
+      expect(toolStarts).toHaveLength(1)
+      expect(toolStarts[0].data.content_block).toMatchObject({ id: "call_1", name: "save" })
+      const args = events.flatMap((event) => event.data.delta?.type === "input_json_delta" ? [event.data.delta.partial_json] : [])
+      expect(args.join("")).toBe(item.arguments)
+      expect(events.filter((event) => event.event === "content_block_stop" && event.data.index === toolStarts[0].data.index))
+        .toHaveLength(1)
+      expect(events.some((event) => event.event === "error")).toBe(false)
+      expect(events.at(-1)?.event).toBe("message_stop")
+    })
+  }
 })

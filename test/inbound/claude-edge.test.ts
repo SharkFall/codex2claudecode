@@ -1424,3 +1424,93 @@ describe("Model_Catalog edge cases", () => {
     expect(beforeLast.data.at(-1)?.id).not.toBe(all.data[all.data.length - 1].id)
   })
 })
+
+describe("Claude canonical tool argument streaming", () => {
+  test("forwards tool arguments while the upstream is still waiting to complete", async () => {
+    let finish!: () => void
+    const gate = new Promise<void>((resolve) => { finish = resolve })
+    const response = claudeCanonicalStreamResponse(
+      {
+        type: "canonical_stream", status: 200, id: "resp_1", model: "model",
+        events: {
+          async *[Symbol.asyncIterator]() {
+            yield { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: '{"value":' } as const
+            await gate
+            yield { type: "tool_call_done", callId: "call_1", name: "save", arguments: '{"value":1}' } as const
+          },
+        },
+      },
+      { model: "model", messages: [], stream: true },
+      { heartbeatMs: 0 },
+    )
+    const reader = response.body!.getReader()
+    const decoder = new TextDecoder()
+    let received = ""
+    try {
+      while (!received.includes(JSON.stringify('{"value":'))) {
+        const chunk = await reader.read()
+        expect(chunk.done).toBe(false)
+        if (chunk.done) break
+        received += decoder.decode(chunk.value, { stream: true })
+      }
+      expect(received).toContain("input_json_delta")
+      expect(received).not.toContain("content_block_stop")
+      finish()
+      for (;;) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        received += decoder.decode(chunk.value, { stream: true })
+      }
+      expect(received).toContain("message_stop")
+      expect(received).not.toContain("event: error")
+    } finally {
+      finish()
+      await reader.cancel()
+      reader.releaseLock()
+    }
+  })
+
+  test("does not duplicate arguments when a full completion follows deltas", async () => {
+    const response = claudeCanonicalStreamResponse(
+      {
+        type: "canonical_stream", status: 200, id: "resp_1", model: "model",
+        events: {
+          async *[Symbol.asyncIterator]() {
+            yield { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: '{"value":' } as const
+            yield { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: "1}" } as const
+            yield { type: "tool_call_done", callId: "call_1", name: "save", arguments: '{"value":1}' } as const
+          },
+        },
+      },
+      { model: "model", messages: [], stream: true },
+      { heartbeatMs: 0 },
+    )
+    const events = await readSse(response)
+    expect(events.filter((event) => event.data.content_block?.type === "tool_use")).toHaveLength(1)
+    expect(events.flatMap((event) => event.data.delta?.partial_json ?? []).join("")).toBe('{"value":1}')
+    expect(events.find((event) => event.event === "message_delta")?.data.delta.stop_reason).toBe("tool_use")
+  })
+
+  for (const failure of ["error_event", "exception", "early_eof"]) {
+    test(`does not report a successful tool completion after ${failure}`, async () => {
+      const response = claudeCanonicalStreamResponse(
+        {
+          type: "canonical_stream", status: 200, id: "resp_1", model: "model",
+          events: {
+            async *[Symbol.asyncIterator]() {
+              yield { type: "tool_call_delta", callId: "call_1", name: "save", argumentsDelta: '{"value":' } as const
+              if (failure === "error_event") yield { type: "error", message: "connection reset" } as const
+              if (failure === "exception") throw new Error("connection reset")
+            },
+          },
+        },
+        { model: "model", messages: [], stream: true },
+        { heartbeatMs: 0 },
+      )
+      const events = await readSse(response)
+      expect(events.at(-1)?.event).toBe("error")
+      expect(events.some((event) => ["content_block_stop", "message_delta", "message_stop"].includes(event.event))).toBe(false)
+      if (failure === "early_eof") expect(events.at(-1)?.data.error.message).toContain("incomplete tool calls")
+    })
+  }
+})
