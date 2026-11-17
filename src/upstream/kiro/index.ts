@@ -21,7 +21,7 @@ import { createKiroMcpSession, requestDeclaresMcpToolsets, type KiroMcpSession }
 import type { KiroServerToolBundle } from "./parse"
 import { convertCanonicalToKiroPayload, trimNoticeText } from "./payload"
 import { collectKiroResponse, streamKiroResponse } from "./parse"
-import { FirstTokenTimeoutError, streamWithFirstTokenRetry } from "./stream-retry"
+import { FirstTokenTimeoutError, ResponseHeadersTimeoutError, streamWithFirstTokenRetry } from "./stream-retry"
 import { KiroHttpError, KiroMcpError, KiroNetworkError, PayloadTooLargeError, ToolNameTooLongError } from "./types"
 import type { KiroEffortSelection } from "./types"
 import { KiroModelMetadataRegistry } from "./model-metadata"
@@ -817,6 +817,7 @@ function streamErrorMessage(error: unknown) {
 
 function mapKiroError(error: unknown): Canonical_ErrorResponse | undefined {
   if (error instanceof FirstTokenTimeoutError) return canonicalError(504, error.message)
+  if (error instanceof ResponseHeadersTimeoutError) return canonicalError(504, error.message)
   if (error instanceof KiroHttpError) return { type: "canonical_error", status: error.status, headers: error.headers, body: publicHttpErrorBody(error.status, error.body, error.category) }
   if (error instanceof KiroNetworkError) return canonicalError(504, error.message)
   if (error instanceof KiroMcpError) return canonicalError(502, error.message)

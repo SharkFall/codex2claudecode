@@ -11,6 +11,16 @@ export class FirstTokenTimeoutError extends Error {
   }
 }
 
+export class ResponseHeadersTimeoutError extends Error {
+  readonly timeoutMs: number
+
+  constructor(timeoutMs: number) {
+    super(`Kiro response headers timed out after ${timeoutMs} ms`)
+    this.name = "ResponseHeadersTimeoutError"
+    this.timeoutMs = timeoutMs
+  }
+}
+
 export async function streamWithFirstTokenRetry(
   makeResponse: (signal?: AbortSignal) => Promise<Response>,
   options: { signal?: AbortSignal; timeoutMs?: number; headersTimeoutMs?: number; maxRetries?: number } = {},
@@ -65,7 +75,7 @@ async function waitForResponse(
     return await Promise.race([
       pending,
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`Kiro response headers timed out after ${timeoutMs} ms`)), timeoutMs)
+        timeout = setTimeout(() => reject(new ResponseHeadersTimeoutError(timeoutMs)), timeoutMs)
         onAbort = () => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))
         signal?.addEventListener("abort", onAbort, { once: true })
         if (signal?.aborted) onAbort()

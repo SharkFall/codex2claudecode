@@ -294,6 +294,32 @@ describe("Kiro upstream provider", () => {
     }
   })
 
+  test("maps response header timeout to a canonical gateway timeout", async () => {
+    const previousTimeout = process.env.KIRO_RESPONSE_HEADERS_TIMEOUT_MS
+    process.env.KIRO_RESPONSE_HEADERS_TIMEOUT_MS = "1"
+    let generateCalls = 0
+    let signalAborted = false
+    try {
+      const result = await providerWithClient({
+        generateAssistantResponse: (_body, options) => {
+          generateCalls += 1
+          options?.signal?.addEventListener("abort", () => { signalAborted = true }, { once: true })
+          return new Promise<Response>(() => {})
+        },
+        listAvailableModels: () => Promise.resolve([]),
+        checkHealth: () => Promise.resolve({ ok: true }),
+      }).proxy(request({ stream: true, tools: [] }))
+
+      expect(result).toMatchObject({ type: "canonical_error", status: 504 })
+      expect(result.type === "canonical_error" ? result.body : "").toContain("response headers timed out")
+      expect(generateCalls).toBe(1)
+      expect(signalAborted).toBe(true)
+    } finally {
+      if (previousTimeout === undefined) delete process.env.KIRO_RESPONSE_HEADERS_TIMEOUT_MS
+      else process.env.KIRO_RESPONSE_HEADERS_TIMEOUT_MS = previousTimeout
+    }
+  })
+
   test("does not apply first-token retry to non-streaming Kiro responses", async () => {
     const previousTimeout = process.env.KIRO_FIRST_TOKEN_TIMEOUT_MS
     const previousRetries = process.env.KIRO_FIRST_TOKEN_MAX_RETRIES
